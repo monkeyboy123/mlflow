@@ -2,7 +2,6 @@ import functools
 import inspect
 from unittest import mock
 import os
-import warnings
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -25,14 +24,15 @@ from mlflow.sklearn.utils import (
     _get_arg_names,
     _truncate_dict,
 )
-from mlflow.utils.mlflow_tags import MLFLOW_PARENT_RUN_ID
-from mlflow.utils.autologging_utils import try_mlflow_log
+from mlflow.utils.mlflow_tags import MLFLOW_PARENT_RUN_ID, MLFLOW_AUTOLOGGING
 from mlflow.utils.validation import (
     MAX_PARAMS_TAGS_PER_BATCH,
     MAX_METRICS_PER_BATCH,
     MAX_PARAM_VAL_LENGTH,
     MAX_ENTITY_KEY_LENGTH,
 )
+
+from tests.autologging.fixtures import test_mode_off
 
 FIT_FUNC_NAMES = ["fit", "fit_transform", "fit_predict"]
 TRAINING_SCORE = "training_score"
@@ -105,33 +105,6 @@ def assert_predict_equal(left, right, X):
 @pytest.fixture(params=FIT_FUNC_NAMES)
 def fit_func_name(request):
     return request.param
-
-
-@pytest.fixture(autouse=True, scope="function")
-def force_try_mlflow_log_to_fail(request):
-    # autolog contains multiple `try_mlflow_log`. They unexpectedly allow tests that
-    # should fail to pass (without us noticing). To prevent that, temporarily turns
-    # warnings emitted by `try_mlflow_log` into errors.
-    if "disable_force_try_mlflow_log_to_fail" in request.keywords:
-        yield
-    else:
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "error", message=r"^Logging to MLflow failed", category=UserWarning,
-            )
-            yield
-
-
-@pytest.mark.xfail(strict=True, raises=UserWarning)
-def test_force_try_mlflow_log_to_fail():
-    with mlflow.start_run():
-        try_mlflow_log(lambda: 1 / 0)
-
-
-@pytest.mark.disable_force_try_mlflow_log_to_fail
-def test_no_force_try_mlflow_log_to_fail():
-    with mlflow.start_run():
-        try_mlflow_log(lambda: 1 / 0)
 
 
 def test_autolog_preserves_original_function_attributes():
@@ -746,7 +719,7 @@ def test_meta_estimator_fit_performs_logging_only_once():
 )
 @pytest.mark.parametrize("backend", [None, "threading", "loky"])
 def test_parameter_search_estimators_produce_expected_outputs(cv_class, search_space, backend):
-    mlflow.sklearn.autolog(log_input_example=True, log_model_signature=True)
+    mlflow.sklearn.autolog(log_input_examples=True, log_model_signatures=True)
 
     svc = sklearn.svm.SVC()
     cv_model = cv_class(svc, search_space, n_jobs=5, return_train_score=True)
@@ -818,6 +791,7 @@ def test_parameter_search_estimators_produce_expected_outputs(cv_class, search_s
         assert child_run.info.status == RunStatus.to_string(RunStatus.FINISHED)
         _, child_metrics, child_tags, _ = get_run_data(child_run.info.run_id)
         assert child_tags == get_expected_class_tags(svc)
+        assert child_run.data.tags.get(MLFLOW_AUTOLOGGING) == mlflow.sklearn.FLAVOR_NAME
         assert "mean_test_score" in child_metrics.keys()
         assert "std_test_score" in child_metrics.keys()
         # Ensure that we do not capture separate metrics for each cross validation split, which
@@ -852,7 +826,7 @@ def test_parameter_search_handles_large_volume_of_metric_outputs():
     assert len(child_run.data.metrics) >= metrics_size
 
 
-@pytest.mark.disable_force_try_mlflow_log_to_fail
+@pytest.mark.usefixtures(test_mode_off.__name__)
 @pytest.mark.parametrize(
     "failing_specialization",
     [
@@ -871,7 +845,7 @@ def test_autolog_does_not_throw_when_parameter_search_logging_fails(failing_spec
         mock_func.assert_called_once()
 
 
-@pytest.mark.disable_force_try_mlflow_log_to_fail
+@pytest.mark.usefixtures(test_mode_off.__name__)
 @pytest.mark.parametrize(
     "func_to_fail",
     ["mlflow.log_params", "mlflow.log_metric", "mlflow.set_tags", "mlflow.sklearn.log_model"],
@@ -891,7 +865,7 @@ def test_autolog_does_not_throw_when_mlflow_logging_fails(func_to_fail):
 
 @pytest.mark.parametrize("data_type", [pd.DataFrame, np.array])
 def test_autolog_logs_signature_and_input_example(data_type):
-    mlflow.sklearn.autolog(log_input_example=True, log_model_signature=True)
+    mlflow.sklearn.autolog(log_input_examples=True, log_model_signatures=True)
 
     X, y = get_iris()
     X = data_type(X)
@@ -944,7 +918,7 @@ def test_autolog_does_not_throw_when_failing_to_sample_X():
 def test_autolog_logs_signature_only_when_estimator_defines_predict():
     from sklearn.cluster import AgglomerativeClustering
 
-    mlflow.sklearn.autolog(log_model_signature=True)
+    mlflow.sklearn.autolog(log_model_signatures=True)
 
     X, y = get_iris()
     model = AgglomerativeClustering()
@@ -964,7 +938,7 @@ def test_autolog_does_not_throw_when_predict_fails():
     with mlflow.start_run() as run, mock.patch(
         "sklearn.linear_model.LinearRegression.predict", side_effect=Exception("Failed")
     ), mock.patch("mlflow.sklearn._logger.warning") as mock_warning:
-        mlflow.sklearn.autolog(log_input_example=True, log_model_signature=True)
+        mlflow.sklearn.autolog(log_input_examples=True, log_model_signatures=True)
         model = sklearn.linear_model.LinearRegression()
         model.fit(X, y)
 
@@ -979,7 +953,7 @@ def test_autolog_does_not_throw_when_infer_signature_fails():
     with mlflow.start_run() as run, mock.patch(
         "mlflow.models.infer_signature", side_effect=Exception("Failed")
     ), mock.patch("mlflow.sklearn._logger.warning") as mock_warning:
-        mlflow.sklearn.autolog(log_input_example=True, log_model_signature=True)
+        mlflow.sklearn.autolog(log_input_examples=True, log_model_signatures=True)
         model = sklearn.linear_model.LinearRegression()
         model.fit(X, y)
 
@@ -989,20 +963,35 @@ def test_autolog_does_not_throw_when_infer_signature_fails():
 
 
 @pytest.mark.large
-@pytest.mark.parametrize("log_input_example", [True, False])
-@pytest.mark.parametrize("log_model_signature", [True, False])
-def test_autolog_configuration_options(log_input_example, log_model_signature):
+@pytest.mark.parametrize("log_input_examples", [True, False])
+@pytest.mark.parametrize("log_model_signatures", [True, False])
+def test_autolog_configuration_options(log_input_examples, log_model_signatures):
     X, y = get_iris()
 
     with mlflow.start_run() as run:
         mlflow.sklearn.autolog(
-            log_input_example=log_input_example, log_model_signature=log_model_signature
+            log_input_examples=log_input_examples, log_model_signatures=log_model_signatures
         )
         model = sklearn.linear_model.LinearRegression()
         model.fit(X, y)
     model_conf = get_model_conf(run.info.artifact_uri)
-    assert ("saved_input_example_info" in model_conf.to_dict()) == log_input_example
-    assert ("signature" in model_conf.to_dict()) == log_model_signature
+    assert ("saved_input_example_info" in model_conf.to_dict()) == log_input_examples
+    assert ("signature" in model_conf.to_dict()) == log_model_signatures
+
+
+@pytest.mark.large
+@pytest.mark.parametrize("log_models", [True, False])
+def test_sklearn_autolog_log_models_configuration(log_models):
+    X, y = get_iris()
+
+    with mlflow.start_run() as run:
+        mlflow.sklearn.autolog(log_models=log_models)
+        model = sklearn.linear_model.LinearRegression()
+        model.fit(X, y)
+
+    run_id = run.info.run_id
+    _, _, _, artifacts = get_run_data(run_id)
+    assert (MODEL_DIR in artifacts) == log_models
 
 
 @pytest.mark.large
